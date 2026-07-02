@@ -406,21 +406,21 @@ def _(
         "v": (float(v_on_scream.min()), float(v_on_scream.max())),
     }
     print(f"Assembled input tensor shape={x_np.shape}")
-    for key, (vmin, vmax) in stats.items():
-        print(f"  {key} range=({vmin:.4f}, {vmax:.4f})")
+    for key, (_vmin, _vmax) in stats.items():
+        print(f"  {key} range=({_vmin:.4f}, {_vmax:.4f})")
 
     return static_forcing, x_np
 
 
 @app.cell
 def _(hrrr_tile, model, np, static_forcing, tile_size, torch):
-    device = next(model.parameters()).device
+    _device = next(model.parameters()).device
     lat_tile = hrrr_tile["lat_tile"].astype("float32")
     lon_tile = hrrr_tile["lon_tile"].astype("float32")
 
     model.set_latlon(
-        lat_deg=torch.from_numpy(lat_tile[None]).to(device),
-        lon_deg=torch.from_numpy(lon_tile[None]).to(device),
+        lat_deg=torch.from_numpy(lat_tile[None]).to(_device),
+        lon_deg=torch.from_numpy(lon_tile[None]).to(_device),
     )
     model.set_tile_size(tile_size)
     model.compile()
@@ -434,7 +434,7 @@ def _(hrrr_tile, model, np, static_forcing, tile_size, torch):
     static_tensor = np.stack([static_dict[name] for name in static_names], axis=0)[:, None]
     model.register_buffer(
         "static_forcing",
-        torch.from_numpy(static_tensor).to(device, dtype=torch.float32),
+        torch.from_numpy(static_tensor).to(_device, dtype=torch.float32),
         persistent=False,
     )
     return
@@ -442,8 +442,8 @@ def _(hrrr_tile, model, np, static_forcing, tile_size, torch):
 
 @app.cell
 def _(hrrr_tile, in_coords, model, n_steps, np, torch, x_np):
-    device = next(model.parameters()).device
-    x_tensor = torch.from_numpy(x_np).to(device)
+    _device = next(model.parameters()).device
+    x_tensor = torch.from_numpy(x_np).to(_device)
     coords_model = dict(in_coords)
     coords_model["face"] = np.array([0], dtype=np.int64)
     coords_model["x"] = np.arange(x_np.shape[-2], dtype=np.int64)
@@ -467,16 +467,16 @@ def _(hrrr_tile, in_coords, model, n_steps, np, torch, x_np):
 
 @app.cell
 def _(in_coords, mo, plt, x_np):
-    all_vars = list(in_coords["variable"])
-    qv_var = [v for v in all_vars if v.startswith("qv_")][-1]
-    vi = all_vars.index(qv_var)
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(x_np[0, vi, 0], cmap="Blues", origin="lower")
-    ax.set_title(f"HRRR IC mapped to SCREAM channels: {qv_var}", fontsize=10)
-    ax.axis("off")
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    _all_vars = list(in_coords["variable"])
+    qv_var = [v for v in _all_vars if v.startswith("qv_")][-1]
+    _vi = _all_vars.index(qv_var)
+    _fig, _ax = plt.subplots(figsize=(6, 5))
+    _im = _ax.imshow(x_np[0, _vi, 0], cmap="Blues", origin="lower")
+    _ax.set_title(f"HRRR IC mapped to SCREAM channels: {qv_var}", fontsize=10)
+    _ax.axis("off")
+    _fig.colorbar(_im, ax=_ax, fraction=0.046, pad=0.04)
     plt.tight_layout()
-    mo.mpl.interactive(fig)
+    mo.mpl.interactive(_fig)
     return (qv_var,)
 
 
@@ -497,35 +497,35 @@ def _(all_outputs, dt_minutes, mo, out_coords, plt, var_selector):
 
     from matplotlib.animation import FuncAnimation
 
-    out_var_names = list(out_coords["variable"])
-    vi = out_var_names.index(var_selector.value)
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.axis("off")
-    vmin = min(arr[0, vi, 0].min() for arr in all_outputs)
-    vmax = max(arr[0, vi, 0].max() for arr in all_outputs)
+    _out_var_names = list(out_coords["variable"])
+    _vi = _out_var_names.index(var_selector.value)
+    _fig, _ax = plt.subplots(figsize=(6, 5))
+    _ax.axis("off")
+    _vmin = min(arr[0, _vi, 0].min() for arr in all_outputs)
+    _vmax = max(arr[0, _vi, 0].max() for arr in all_outputs)
     if "omega" in var_selector.value:
-        vlim = max(abs(vmin), abs(vmax))
-        vmin, vmax = -vlim, vlim
-    im = ax.imshow(
-        all_outputs[0][0, vi, 0],
+        _vlim = max(abs(_vmin), abs(_vmax))
+        _vmin, _vmax = -_vlim, _vlim
+    _im = _ax.imshow(
+        all_outputs[0][0, _vi, 0],
         cmap="RdBu_r",
         origin="lower",
-        vmin=vmin,
-        vmax=vmax,
+        vmin=_vmin,
+        vmax=_vmax,
     )
-    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-    title = ax.set_title("")
+    _fig.colorbar(_im, ax=_ax, fraction=0.046, pad=0.04)
+    _title = _ax.set_title("")
 
-    def update(step):
-        im.set_data(all_outputs[step][0, vi, 0])
-        title.set_text(f"{var_selector.value}  +{dt_minutes * (step + 1) / 60:.1f} h")
-        return [im, title]
+    def _update(step):
+        _im.set_data(all_outputs[step][0, _vi, 0])
+        _title.set_text(f"{var_selector.value}  +{dt_minutes * (step + 1) / 60:.1f} h")
+        return [_im, _title]
 
-    anim = FuncAnimation(fig, update, frames=len(all_outputs), blit=True)
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    anim.save(tmp.name, writer="ffmpeg", fps=5)
-    plt.close(fig)
-    mo.video(open(tmp.name, "rb").read())
+    _anim = FuncAnimation(_fig, _update, frames=len(all_outputs), blit=True)
+    _tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    _anim.save(_tmp.name, writer="ffmpeg", fps=5)
+    plt.close(_fig)
+    mo.video(open(_tmp.name, "rb").read())
     return
 
 
