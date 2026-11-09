@@ -31,6 +31,7 @@ Usage::
 from __future__ import annotations
 
 import dataclasses
+import os
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -109,6 +110,14 @@ class DiTConfig:
     index_is_latlon: bool = False
 
     # Dealiased patch embedding (shift-invariant PatchEmbed3D)
+    # Stereographic-RoPE coordinate unit: radians per RoPE phase unit, per
+    # FINE PIXEL (the backbone stage multiplies by patch_size_horiz, the
+    # pixel/cross-attention stages use it directly). 0 = the historical
+    # default, sqrt(pi/(3*1024**2)) per pixel (a HEALPix-nside-1024 unit
+    # every shipped checkpoint was trained with — leave at 0 to reproduce
+    # them bit-exactly). Override for grids of a different density, e.g. the
+    # target grid's pixel spacing sqrt(4*pi/ncol).
+    rope_length_scale: float = 0.0
     use_dealiased_patch_embed: bool = False
     dealias_resample_filter: tuple[int, ...] = field(
         default_factory=lambda: (1, 4, 6, 4, 1)
@@ -298,8 +307,11 @@ class DataConfig:
     backtest_end_index: int | None = None
     backtest_stride: int | None = None
 
-    # Static data paths
-    latlon_path: str = "data/latlon_ne1024pg2.nc"
+    # Static data paths. Resolved when this module is imported, after dotenv
+    # has loaded AUX_DATA_ROOT. Unset, this stays data/latlon_ne1024pg2.nc.
+    latlon_path: str = os.path.join(
+        os.environ.get("AUX_DATA_ROOT", "data"), "latlon_ne1024pg2.nc"
+    )
 
     def __post_init__(self) -> None:
         if self.grid_type and self.grid_type.lower() not in {"healpix", "cubesphere"}:

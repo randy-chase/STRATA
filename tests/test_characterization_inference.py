@@ -26,8 +26,8 @@ For each production config we build a **small stand-in** of the real
 architecture: the exact ``DiTConfig`` / ``PixelDiTConfig`` flags from
 ``train_configs.CONFIGS[name]`` (so every production code path is exercised),
 with only the sizes shrunk (``embed_dim``/``n_layers``/``tile``/``depth``) so the
-test is fast. The model is built through the real ``train.DiT3D`` /
-``train.DiT3DPixel`` builders, so it tracks the production construction path.
+test is fast. The model is built through the real ``train.build_backbone`` /
+``train.build_strata`` builders, so it tracks the production construction path.
 
 Two subtleties make the guard reliable:
 
@@ -38,16 +38,17 @@ Two subtleties make the guard reliable:
   *by sorted name* after construction, so identical (name, shape) param sets
   produce identical weights regardless of construction order. Only a genuine
   change to the forward math can move the output.
-* **fp32 / eval / fixed input.** Deterministic forward, no bf16, no dropout.
+* **fp32 / eval / fixed input.** Deterministic forward, no bf16, no dropout,
+  and TF32 disabled for the test (see ``_strict_fp32``).
 
 Usage
 -----
-Requires a GPU (the DiT stack uses transformer_engine + natten). The golden
+Requires a GPU (the DiT stack uses natten CUDA kernels). The golden
 tensors are **local/transient and git-ignored** — they are binaries, which this
 repo must not check in (see ``AGENTS.md``). Regenerate them at the start of a
 cleanup session, **before** the first deletion::
 
-    source ~/Documents/python_envs/screamcast_env/bin/activate
+    # in your training environment (the docker image or an equivalent venv)
     SCREAMCAST_REGEN_GOLDEN=1 pytest tests/test_characterization_inference.py -q
 
 Then, after each cleanup step, re-run *without* the env var; any change to
@@ -88,8 +89,23 @@ TILE, DEPTH, NSIDE, CH = 64, 12, 512, 6
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="DiT stack requires CUDA (transformer_engine + natten)",
+    reason="DiT stack requires CUDA (natten kernels)",
 )
+
+
+@pytest.fixture(autouse=True)
+def _strict_fp32():
+    """Run the forward in true fp32, whatever the environment's TF32 default.
+
+    NGC PyTorch images enable TF32 matmuls/convs, which moves these outputs by
+    ~2e-4, above ATOL; goldens generated with TF32 off would then fail in an
+    image with it on, and vice versa. Restores the previous flags afterwards.
+    """
+    matmul, cudnn = torch.backends.cuda.matmul, torch.backends.cudnn
+    saved = matmul.allow_tf32, cudnn.allow_tf32
+    matmul.allow_tf32 = cudnn.allow_tf32 = False
+    yield
+    matmul.allow_tf32, cudnn.allow_tf32 = saved
 
 
 def _fill_params_deterministically(model: torch.nn.Module) -> torch.nn.Module:
@@ -137,9 +153,9 @@ def _build_small(name: str) -> torch.nn.Module:
             n_layers=SMALL_PIXEL_LAYERS,
             num_heads=SMALL_PIXEL_HEADS,
         )
-        net = train.DiT3DPixel(**common, pixel_cfg=pix)
+        net = train.build_strata(**common, pixel_cfg=pix)
     else:
-        net = train.DiT3D(**common)
+        net = train.build_backbone(**common)
     return net.cuda(), dit.index_is_latlon
 
 
