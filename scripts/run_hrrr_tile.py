@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,11 @@ import torch
 import xarray as xr
 import zarr
 from pyproj import CRS, Transformer
+
+# Ensure repo-local imports resolve even when launched outside repo root.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import screamcast.earth2studio_wrappers as e2w
 from screamcast.thermodynamics import potential_temperature_from_temperature
@@ -384,7 +390,7 @@ def main() -> None:
         raise FileNotFoundError(
             f"checkpoint not found: {checkpoint_path}\n"
             "Download from HF, e.g.:\n"
-            "  huggingface-cli download nvidia/strata checkpoints/strata_v1.pth --local-dir ."
+            "  hf download nvidia/strata checkpoints/strata_v1.pth --local-dir /mnt/nvme/strata_v1"
         )
 
     aux_root = Path(os.environ.get("AUX_DATA_ROOT", "data")).expanduser().resolve()
