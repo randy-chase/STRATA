@@ -414,9 +414,11 @@ def build_static_forcing_tile(
             f"but {latlon_path} has {src_lat.shape[0]} columns."
         )
 
-    tgt_lat = lat_tile.reshape(-1)
-    tgt_lon = lon_tile.reshape(-1)
-    interp = KNNS2Interpolator(src_lon, src_lat, tgt_lon, tgt_lat, k=1).float()
+    src_lat_t = torch.from_numpy(src_lat)
+    src_lon_t = torch.from_numpy(src_lon)
+    tgt_lat_t = torch.from_numpy(lat_tile.reshape(-1))
+    tgt_lon_t = torch.from_numpy(lon_tile.reshape(-1))
+    interp = KNNS2Interpolator(src_lon_t, src_lat_t, tgt_lon_t, tgt_lat_t, k=1).float()
     src_sgh30_t = torch.from_numpy(src_sgh30.astype(np.float32))
     sgh30 = interp(src_sgh30_t).detach().cpu().numpy().reshape(lat_tile.shape)
 
