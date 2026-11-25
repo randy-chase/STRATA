@@ -371,6 +371,8 @@ def run_rollout(
 
 def save_rollout_netcdf(
     output_path: Path,
+    initial_condition: np.ndarray,
+    input_variable_names: list[str],
     outputs: np.ndarray,
     out_coords: dict[str, np.ndarray],
     analysis_time: np.datetime64,
@@ -381,6 +383,20 @@ def save_rollout_netcdf(
     prs_root: str,
     sfc_root: str,
 ) -> None:
+    # initial_condition shape: [batch, variable, face, x, y]
+    if initial_condition.ndim != 5:
+        raise ValueError(f"unexpected initial-condition rank: {initial_condition.ndim}")
+    if initial_condition.shape[0] != 1 or initial_condition.shape[2] != 1:
+        raise ValueError(
+            "expected initial_condition with batch=1 and face=1, got "
+            f"batch={initial_condition.shape[0]} face={initial_condition.shape[2]}"
+        )
+    if initial_condition.shape[1] != len(input_variable_names):
+        raise ValueError(
+            "input_variable_names length does not match initial_condition channels: "
+            f"{len(input_variable_names)} vs {initial_condition.shape[1]}"
+        )
+
     # outputs shape: [step, batch, variable, face, x, y]
     if outputs.ndim != 6:
         raise ValueError(f"unexpected rollout output rank: {outputs.ndim}")
@@ -396,12 +412,17 @@ def save_rollout_netcdf(
     lead_timedelta = np.array(
         [np.timedelta64(int(round(dt_minutes * i)), "m") for i in range(1, step_count + 1)]
     )
+    input_variable = np.asarray(input_variable_names).astype(str)
     variable_names = np.asarray(out_coords["variable"]).astype(str)
     x_coords = np.asarray(out_coords["x"], dtype=np.int64)
     y_coords = np.asarray(out_coords["y"], dtype=np.int64)
 
     ds = xr.Dataset(
         data_vars={
+            "initial_condition": (
+                ("input_variable", "x", "y"),
+                initial_condition[0, :, 0, :, :].astype(np.float32),
+            ),
             "forecast": (
                 ("lead_time", "variable", "x", "y"),
                 outputs[:, 0, :, 0, :, :].astype(np.float32),
@@ -412,6 +433,7 @@ def save_rollout_netcdf(
         coords={
             "lead_time": lead_timedelta,
             "lead_time_hours": ("lead_time", lead_hours),
+            "input_variable": input_variable,
             "variable": variable_names,
             "x": x_coords,
             "y": y_coords,
@@ -537,6 +559,8 @@ def main() -> None:
 
     save_rollout_netcdf(
         output_path=output_path,
+        initial_condition=x_np,
+        input_variable_names=input_vars,
         outputs=outputs,
         out_coords=out_coords,
         analysis_time=analysis_time,
