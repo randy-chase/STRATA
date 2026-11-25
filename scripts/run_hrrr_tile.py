@@ -330,7 +330,7 @@ def run_rollout(
     x_np: np.ndarray,
     analysis_time: np.datetime64,
     n_steps: int,
-) -> None:
+) -> tuple[np.ndarray, dict[str, np.ndarray], float]:
     device = next(model.parameters()).device
     x_tensor = torch.from_numpy(x_np).to(device=device, dtype=torch.float32)
 
@@ -345,12 +345,17 @@ def run_rollout(
     print(
         f"rollout setup: input_shape={tuple(x_np.shape)} steps={n_steps} dt_minutes={dt_minutes:.1f}"
     )
+    outputs: list[np.ndarray] = []
+    out_coords_ref: dict[str, np.ndarray] | None = None
     with torch.inference_mode():
         iterator = model.create_iterator(x_tensor, coords)
         next(iterator)  # lead_time=0
         for step in range(1, n_steps + 1):
             out, out_coords = next(iterator)
             out_np = out.detach().cpu().numpy()
+            outputs.append(out_np.copy())
+            if out_coords_ref is None:
+                out_coords_ref = dict(out_coords)
             has_nan = bool(np.isnan(out_np).any())
             print(
                 f"step={step:02d} lead_hours={float(dt_minutes * step / 60.0):.2f} "
@@ -359,6 +364,70 @@ def run_rollout(
             if has_nan:
                 raise RuntimeError("NaN detected in model output.")
     print("rollout completed")
+    if out_coords_ref is None:
+        raise RuntimeError("rollout produced no output steps.")
+    return np.stack(outputs, axis=0), out_coords_ref, float(dt_minutes)
+
+
+def save_rollout_netcdf(
+    output_path: Path,
+    outputs: np.ndarray,
+    out_coords: dict[str, np.ndarray],
+    analysis_time: np.datetime64,
+    dt_minutes: float,
+    lat_tile: np.ndarray,
+    lon_tile: np.ndarray,
+    checkpoint_path: Path,
+    prs_root: str,
+    sfc_root: str,
+) -> None:
+    # outputs shape: [step, batch, variable, face, x, y]
+    if outputs.ndim != 6:
+        raise ValueError(f"unexpected rollout output rank: {outputs.ndim}")
+    if outputs.shape[1] != 1 or outputs.shape[3] != 1:
+        raise ValueError(
+            f"expected batch=1 and face=1, got batch={outputs.shape[1]} face={outputs.shape[3]}"
+        )
+
+    step_count = outputs.shape[0]
+    lead_hours = np.arange(1, step_count + 1, dtype=np.float32) * np.float32(
+        dt_minutes / 60.0
+    )
+    lead_timedelta = np.array(
+        [np.timedelta64(int(round(dt_minutes * i)), "m") for i in range(1, step_count + 1)]
+    )
+    variable_names = np.asarray(out_coords["variable"]).astype(str)
+    x_coords = np.asarray(out_coords["x"], dtype=np.int64)
+    y_coords = np.asarray(out_coords["y"], dtype=np.int64)
+
+    ds = xr.Dataset(
+        data_vars={
+            "forecast": (
+                ("lead_time", "variable", "x", "y"),
+                outputs[:, 0, :, 0, :, :].astype(np.float32),
+            ),
+            "lat": (("x", "y"), np.asarray(lat_tile, dtype=np.float32)),
+            "lon": (("x", "y"), np.asarray(lon_tile, dtype=np.float32)),
+        },
+        coords={
+            "lead_time": lead_timedelta,
+            "lead_time_hours": ("lead_time", lead_hours),
+            "variable": variable_names,
+            "x": x_coords,
+            "y": y_coords,
+        },
+        attrs={
+            "analysis_time": str(analysis_time),
+            "checkpoint_path": str(checkpoint_path),
+            "hrrr_prs_root": prs_root,
+            "hrrr_sfc_root": sfc_root,
+            "dt_minutes": float(dt_minutes),
+        },
+    )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    ds.to_netcdf(output_path)
+    print(f"wrote netcdf: {output_path}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -377,6 +446,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--center-lon", type=float, default=-97.0)
     parser.add_argument("--tile-size", type=int, default=256)
     parser.add_argument("--steps", type=int, default=3)
+    parser.add_argument(
+        "--output-netcdf",
+        default=os.environ.get("HRRR_OUTPUT_NETCDF", ""),
+        help="Optional output NetCDF path for rollout fields.",
+    )
     parser.add_argument("--cpu", action="store_true", help="Run on CPU only.")
     parser.add_argument("--no-bf16", action="store_true", help="Disable bf16 setup.")
     return parser.parse_args()
@@ -447,11 +521,31 @@ def main() -> None:
         static_tile=static_tile,
         tile_size=args.tile_size,
     )
-    run_rollout(
+    outputs, out_coords, dt_minutes = run_rollout(
         model=model,
         x_np=x_np,
         analysis_time=analysis_time,
         n_steps=args.steps,
+    )
+
+    output_netcdf = args.output_netcdf.strip()
+    if output_netcdf:
+        output_path = Path(output_netcdf).expanduser().resolve()
+    else:
+        timestamp = str(analysis_time).replace(":", "").replace("-", "")
+        output_path = Path("/mnt/nvme/strata_outputs") / f"hrrr_rollout_{timestamp}.nc"
+
+    save_rollout_netcdf(
+        output_path=output_path,
+        outputs=outputs,
+        out_coords=out_coords,
+        analysis_time=analysis_time,
+        dt_minutes=dt_minutes,
+        lat_tile=np.asarray(hrrr["lat_tile"], dtype=np.float32),
+        lon_tile=np.asarray(hrrr["lon_tile"], dtype=np.float32),
+        checkpoint_path=checkpoint_path,
+        prs_root=str(hrrr["prs_root"]),
+        sfc_root=str(hrrr["sfc_root"]),
     )
 
 
