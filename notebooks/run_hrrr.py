@@ -305,6 +305,11 @@ def _(
 
     level_start, level_end, plevel = 8, 32, 1
     level_indices = np.arange(level_start, level_end, plevel, dtype=np.int64)
+    # Channel labels index the 32-level training subset hyam[3::4], not the
+    # native 128-level file. See tests/test_plev_pipeline.py.
+    if hyam_all.shape[0] != 32:
+        hyam_all = hyam_all[3::4]
+        hybm_all = hybm_all[3::4]
     hyam = hyam_all[level_indices]
     hybm = hybm_all[level_indices]
 

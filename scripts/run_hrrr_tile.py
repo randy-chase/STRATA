@@ -89,6 +89,11 @@ STATIC_FORCING_ORDER = ("phis", "sgh30", "landfrac")
 SCREAM_LEVEL_START = 8
 SCREAM_LEVEL_END = 32
 SCREAM_PLEVEL = 1
+# Training zarr / channel labels are the 32-level subset of the 128-level
+# hybrid grid: hyam_sub = hyam_full[3::4]. Channel ``k`` is hyam_sub[k],
+# not hyam_full[k]. See tests/test_plev_pipeline.py.
+SCREAM_VERTICAL_SUBSET = slice(3, None, 4)
+SCREAM_NATIVE_NLEV = 32
 
 
 def _open_array(fs: s3fs.S3FileSystem, path: str) -> zarr.Array:
@@ -318,6 +323,39 @@ def validate_hrrr_input_units(
     )
 
 
+def _subsampled_hybrid_coefficients(
+    hyam_all: np.ndarray, hybm_all: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map full-grid hybrid coefficients onto the 32-level training subset.
+
+    ``scream_vertical_coordinate.nc`` stores 128 native SCREAM mid-levels.
+    The released checkpoint channels are labeled against the subsampled
+    zarr grid ``hyam[3::4]`` (32 levels). Indexing the 128-level arrays with
+    those labels (e.g. ``hyam[8:32]``) selects stratosphere-only pressures.
+    """
+    hyam_all = np.asarray(hyam_all, dtype=np.float32).reshape(-1)
+    hybm_all = np.asarray(hybm_all, dtype=np.float32).reshape(-1)
+    if hyam_all.shape != hybm_all.shape:
+        raise ValueError(
+            f"hyam/hybm length mismatch: {hyam_all.shape} vs {hybm_all.shape}"
+        )
+    if hyam_all.shape[0] == SCREAM_NATIVE_NLEV:
+        return hyam_all, hybm_all
+    if hyam_all.shape[0] < SCREAM_NATIVE_NLEV:
+        raise ValueError(
+            f"hyam has {hyam_all.shape[0]} levels; expected {SCREAM_NATIVE_NLEV} "
+            "or the full 128-level native grid."
+        )
+    hyam_sub = hyam_all[SCREAM_VERTICAL_SUBSET]
+    hybm_sub = hybm_all[SCREAM_VERTICAL_SUBSET]
+    if hyam_sub.shape[0] != SCREAM_NATIVE_NLEV:
+        raise ValueError(
+            f"vertical subset {SCREAM_VERTICAL_SUBSET} produced {hyam_sub.shape[0]} "
+            f"levels, expected {SCREAM_NATIVE_NLEV}."
+        )
+    return hyam_sub, hybm_sub
+
+
 def _target_pressures_from_aux(
     vertical_coordinate_path: str,
     surface_pressure_pa: np.ndarray,
@@ -326,11 +364,12 @@ def _target_pressures_from_aux(
         hyam_all = ds_vert["hyam"].values.astype(np.float32)
         hybm_all = ds_vert["hybm"].values.astype(np.float32)
         p0_pa = float(ds_vert["P0"].values) if "P0" in ds_vert else 100000.0
+    hyam_sub, hybm_sub = _subsampled_hybrid_coefficients(hyam_all, hybm_all)
     level_indices = np.arange(
         SCREAM_LEVEL_START, SCREAM_LEVEL_END, SCREAM_PLEVEL, dtype=np.int64
     )
-    hyam = hyam_all[level_indices]
-    hybm = hybm_all[level_indices]
+    hyam = hyam_sub[level_indices]
+    hybm = hybm_sub[level_indices]
     target_pressure = (
         hyam[:, None, None] * p0_pa + hybm[:, None, None] * surface_pressure_pa[None]
     ).astype(np.float32)
@@ -390,11 +429,28 @@ def build_scream_inputs(
         np.float32
     )[None, :, None]
 
+    pmin_hpa = float(target_pressure.min() / 100.0)
+    pmax_hpa = float(target_pressure.max() / 100.0)
+    # Levels 8-31 of the 32-level SCREAM subset should sit in the troposphere
+    # / lower stratosphere, not the native-grid stratosphere (hyam[8:32]).
+    if pmax_hpa < 400.0:
+        raise ValueError(
+            "target hybrid pressures look stratospheric "
+            f"(max={pmax_hpa:.1f} hPa). Channel labels 8-31 must index the "
+            "32-level training subset hyam[3::4], not the full 128-level file."
+        )
+    if float(qv_on_scream.max()) < 1.0e-4:
+        raise ValueError(
+            "interpolated qv max is stratospheric "
+            f"({float(qv_on_scream.max()):.3g} kg/kg); check hybrid-level mapping."
+        )
+
     stats = {
         "theta": (float(theta_on_scream.min()), float(theta_on_scream.max())),
         "qv": (float(qv_on_scream.min()), float(qv_on_scream.max())),
         "u": (float(u_on_scream.min()), float(u_on_scream.max())),
         "v": (float(v_on_scream.min()), float(v_on_scream.max())),
+        "target_pressure_hpa": (pmin_hpa, pmax_hpa),
     }
     return x_np, stats
 
