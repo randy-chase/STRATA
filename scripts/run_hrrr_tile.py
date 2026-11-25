@@ -161,6 +161,7 @@ def fetch_hrrr_tile(
     center_lat: float,
     center_lon: float,
     tile_size: int,
+    wind_frame: str,
 ) -> dict[str, np.ndarray | np.datetime64 | str | tuple[int, int]]:
     fs = s3fs.S3FileSystem(anon=True)
     prs_root, sfc_root = _hrrr_run_roots(analysis_time)
@@ -180,6 +181,31 @@ def fetch_hrrr_tile(
             axis=0,
         )
 
+    u_pr = _read_pr("UGRD")
+    v_pr = _read_pr("VGRD")
+    if wind_frame == "grid_relative_to_earth":
+        # HRRR Lambert grid-relative winds can be rotated into earth-relative
+        # east/north components using the local meridian convergence angle.
+        lon0_deg = -97.5  # 262.5E central meridian
+        cone = np.sin(np.deg2rad(38.5)).astype(np.float32)
+        dlon_rad = np.deg2rad(((lon_tile - lon0_deg + 180.0) % 360.0) - 180.0).astype(
+            np.float32
+        )
+        alpha = cone * dlon_rad
+        cos_a = np.cos(alpha).astype(np.float32)[None]
+        sin_a = np.sin(alpha).astype(np.float32)[None]
+        u_pr, v_pr = (
+            u_pr * cos_a + v_pr * sin_a,
+            -u_pr * sin_a + v_pr * cos_a,
+        )
+        print(
+            "wind frame conversion: grid_relative_to_earth "
+            f"(alpha_deg range=[{float(np.rad2deg(alpha).min()):.3g},"
+            f"{float(np.rad2deg(alpha).max()):.3g}])"
+        )
+    elif wind_frame != "as_is":
+        raise ValueError(f"unknown wind_frame={wind_frame!r}")
+
     return {
         "analysis_time": analysis_time,
         "prs_root": prs_root,
@@ -188,8 +214,8 @@ def fetch_hrrr_tile(
         "lat_tile": lat_tile.astype("float32"),
         "lon_tile": lon_tile.astype("float32"),
         "temp": _read_pr("TMP"),
-        "u": _read_pr("UGRD"),
-        "v": _read_pr("VGRD"),
+        "u": u_pr.astype(np.float32),
+        "v": v_pr.astype(np.float32),
         "z_mid": _read_pr("HGT"),
         "omega": _read_pr("VVEL"),
         "qv": _read_pr("SPFH"),
@@ -315,7 +341,7 @@ def build_scream_inputs(
     hrrr: dict[str, np.ndarray | np.datetime64 | str | tuple[int, int]],
     in_variable_names: list[str],
     vertical_coordinate_path: str,
-) -> tuple[np.ndarray, np.ndarray, dict[str, tuple[float, float]]]:
+) -> tuple[np.ndarray, dict[str, tuple[float, float]]]:
     ps = np.asarray(hrrr["ps"], dtype=np.float32)
     target_pressure, level_indices, p0_pa = _target_pressures_from_aux(
         vertical_coordinate_path, ps
@@ -489,6 +515,7 @@ def configure_model_for_hrrr_tile(
 def run_rollout(
     model: e2w.ScreamcastModel,
     x_np: np.ndarray,
+    input_variable_names: list[str],
     analysis_time: np.datetime64,
     n_steps: int,
 ) -> tuple[np.ndarray, dict[str, np.ndarray], float]:
@@ -508,6 +535,24 @@ def run_rollout(
     )
     outputs: list[np.ndarray] = []
     out_coords_ref: dict[str, np.ndarray] | None = None
+    tracked_names: list[str] = []
+    in_var_to_idx = {name: i for i, name in enumerate(input_variable_names)}
+    prev_named_state = {
+        name: x_np[0, idx, 0].copy() for name, idx in in_var_to_idx.items()
+    }
+
+    def _pick_deepest(var_names: list[str], prefix: str) -> str | None:
+        candidates: list[tuple[int, str]] = []
+        for name in var_names:
+            if name.startswith(f"{prefix}_"):
+                suffix = name.rsplit("_", 1)[1]
+                if suffix.isdigit():
+                    candidates.append((int(suffix), name))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda x: x[0])
+        return candidates[-1][1]
+
     with torch.inference_mode():
         iterator = model.create_iterator(x_tensor, coords)
         next(iterator)  # lead_time=0
@@ -517,11 +562,35 @@ def run_rollout(
             outputs.append(out_np.copy())
             if out_coords_ref is None:
                 out_coords_ref = dict(out_coords)
+                out_var_names = [str(v) for v in out_coords_ref["variable"]]
+                tracked_names = [name for name in ("T_2m",) if name in out_var_names]
+                for prefix in ("U", "V", "omega"):
+                    picked = _pick_deepest(out_var_names, prefix)
+                    if picked is not None:
+                        tracked_names.append(picked)
             has_nan = bool(np.isnan(out_np).any())
             print(
                 f"step={step:02d} lead_hours={float(dt_minutes * step / 60.0):.2f} "
                 f"min={float(out_np.min()):.5g} max={float(out_np.max()):.5g} nan={has_nan}"
             )
+            if tracked_names:
+                out_var_names = [str(v) for v in out_coords["variable"]]
+                out_var_to_idx = {name: i for i, name in enumerate(out_var_names)}
+                parts: list[str] = []
+                for name in tracked_names:
+                    idx = out_var_to_idx.get(name)
+                    if idx is None:
+                        continue
+                    cur = out_np[0, idx, 0]
+                    cur_mean = float(cur.mean())
+                    if name in prev_named_state:
+                        dmean = cur_mean - float(prev_named_state[name].mean())
+                        parts.append(f"{name}:mean={cur_mean:.4f},dmean={dmean:+.4f}")
+                    else:
+                        parts.append(f"{name}:mean={cur_mean:.4f}")
+                    prev_named_state[name] = cur.copy()
+                if parts:
+                    print("  diagnostics " + " | ".join(parts))
             if has_nan:
                 raise RuntimeError("NaN detected in model output.")
     print("rollout completed")
@@ -630,6 +699,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tile-size", type=int, default=256)
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument(
+        "--wind-frame",
+        default=os.environ.get("HRRR_WIND_FRAME", "as_is"),
+        choices=("as_is", "grid_relative_to_earth"),
+        help=(
+            "Interpretation of HRRR UGRD/VGRD: 'as_is' passes through unchanged; "
+            "'grid_relative_to_earth' applies Lambert-conformal wind rotation."
+        ),
+    )
+    parser.add_argument(
         "--static-source",
         default=os.environ.get("HRRR_STATIC_SOURCE", "scream"),
         choices=("scream", "hrrr_mixed"),
@@ -678,6 +756,7 @@ def main() -> None:
         center_lat=args.center_lat,
         center_lon=args.center_lon,
         tile_size=args.tile_size,
+        wind_frame=args.wind_frame,
     )
     print(
         f"hrrr roots: prs={hrrr['prs_root']} sfc={hrrr['sfc_root']} nearest={hrrr['nearest_index']}"
@@ -724,6 +803,7 @@ def main() -> None:
     outputs, out_coords, dt_minutes = run_rollout(
         model=model,
         x_np=x_np,
+        input_variable_names=input_vars,
         analysis_time=analysis_time,
         n_steps=args.steps,
     )
