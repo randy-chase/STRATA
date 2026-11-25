@@ -373,16 +373,16 @@ def build_scream_inputs(
     return x_np, stats
 
 
-def _resolve_sgh30_path(aux_root: Path, checkpoint_path: Path) -> Path:
+def _resolve_static_path(aux_root: Path, checkpoint_path: Path, var_name: str) -> Path:
     candidates = [
-        aux_root / "sgh30.npy",
-        checkpoint_path.parent.parent / "sgh30.npy",
+        aux_root / f"{var_name}.npy",
+        checkpoint_path.parent.parent / f"{var_name}.npy",
     ]
     for candidate in candidates:
         if candidate.exists():
             return candidate
     raise FileNotFoundError(
-        "Could not find sgh30.npy. Expected one of:\n"
+        f"Could not find {var_name}.npy. Expected one of:\n"
         f"  {candidates[0]}\n"
         f"  {candidates[1]}"
     )
@@ -393,38 +393,52 @@ def build_static_forcing_tile(
     *,
     aux_root: Path,
     checkpoint_path: Path,
+    static_source: str,
 ) -> np.ndarray:
     lat_tile = np.asarray(hrrr["lat_tile"], dtype=np.float32)
     lon_tile = np.asarray(hrrr["lon_tile"], dtype=np.float32)
-    phis = np.asarray(hrrr["hgt_sfc"], dtype=np.float32) * GRAVITY
-    landfrac = np.asarray(hrrr["landfrac"], dtype=np.float32)
 
     latlon_path = aux_root / "latlon_ne1024pg2.nc"
     if not latlon_path.exists():
         raise FileNotFoundError(f"missing required file: {latlon_path}")
-    sgh30_path = _resolve_sgh30_path(aux_root=aux_root, checkpoint_path=checkpoint_path)
 
     with xr.open_dataset(latlon_path) as ds_ll:
         src_lat = np.asarray(ds_ll["lat"].values, dtype=np.float32).reshape(-1)
         src_lon = np.asarray(ds_ll["lon"].values, dtype=np.float32).reshape(-1)
-    src_sgh30 = np.asarray(np.load(sgh30_path), dtype=np.float32).reshape(-1)
-    if src_sgh30.shape[0] != src_lat.shape[0]:
-        raise ValueError(
-            f"sgh30 size mismatch: {sgh30_path} has {src_sgh30.shape[0]} values, "
-            f"but {latlon_path} has {src_lat.shape[0]} columns."
-        )
-
     src_lat_t = torch.from_numpy(src_lat)
     src_lon_t = torch.from_numpy(src_lon)
     tgt_lat_t = torch.from_numpy(lat_tile.reshape(-1))
     tgt_lon_t = torch.from_numpy(lon_tile.reshape(-1))
     interp = KNNS2Interpolator(src_lon_t, src_lat_t, tgt_lon_t, tgt_lat_t, k=1).float()
-    src_sgh30_t = torch.from_numpy(src_sgh30.astype(np.float32))
-    sgh30 = interp(src_sgh30_t).detach().cpu().numpy().reshape(lat_tile.shape)
+
+    def _regrid_static(var_name: str) -> np.ndarray:
+        src_path = _resolve_static_path(
+            aux_root=aux_root, checkpoint_path=checkpoint_path, var_name=var_name
+        )
+        src_vals = np.asarray(np.load(src_path), dtype=np.float32).reshape(-1)
+        if src_vals.shape[0] != src_lat.shape[0]:
+            raise ValueError(
+                f"{var_name} size mismatch: {src_path} has {src_vals.shape[0]} values, "
+                f"but {latlon_path} has {src_lat.shape[0]} columns."
+            )
+        src_vals_t = torch.from_numpy(src_vals)
+        return interp(src_vals_t).detach().cpu().numpy().reshape(lat_tile.shape)
+
+    if static_source == "scream":
+        phis = _regrid_static("phis")
+        sgh30 = _regrid_static("sgh30")
+        landfrac = _regrid_static("landfrac")
+    elif static_source == "hrrr_mixed":
+        phis = np.asarray(hrrr["hgt_sfc"], dtype=np.float32) * GRAVITY
+        sgh30 = _regrid_static("sgh30")
+        landfrac = np.asarray(hrrr["landfrac"], dtype=np.float32)
+    else:
+        raise ValueError(f"unknown static_source={static_source!r}")
 
     static_tile = np.stack([phis, sgh30, landfrac], axis=0).astype(np.float32)[:, None]
     print(
         "static forcing ranges: "
+        f"source={static_source} "
         f"phis=[{float(phis.min()):.5g},{float(phis.max()):.5g}] "
         f"sgh30=[{float(sgh30.min()):.5g},{float(sgh30.max()):.5g}] "
         f"landfrac=[{float(landfrac.min()):.5g},{float(landfrac.max()):.5g}]"
@@ -616,6 +630,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tile-size", type=int, default=256)
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument(
+        "--static-source",
+        default=os.environ.get("HRRR_STATIC_SOURCE", "scream"),
+        choices=("scream", "hrrr_mixed"),
+        help=(
+            "Static forcing source: 'scream' uses released phis/sgh30/landfrac "
+            "regridded to the HRRR tile; 'hrrr_mixed' uses HRRR phis/landfrac plus "
+            "released sgh30."
+        ),
+    )
+    parser.add_argument(
         "--output-netcdf",
         default=os.environ.get("HRRR_OUTPUT_NETCDF", ""),
         help="Optional output NetCDF path for rollout fields.",
@@ -684,6 +708,7 @@ def main() -> None:
         hrrr=hrrr,
         aux_root=aux_root,
         checkpoint_path=checkpoint_path,
+        static_source=args.static_source,
     )
     print(f"input tensor shape={tuple(x_np.shape)}")
     for key, (vmin, vmax) in stats.items():
