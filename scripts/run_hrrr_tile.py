@@ -199,6 +199,98 @@ def fetch_hrrr_tile(
     }
 
 
+def _require_finite(name: str, values: np.ndarray) -> None:
+    if not np.isfinite(values).all():
+        raise ValueError(f"{name} contains NaN/Inf values.")
+
+
+def validate_hrrr_input_units(
+    hrrr: dict[str, np.ndarray | np.datetime64 | str | tuple[int, int]]
+) -> None:
+    temp = np.asarray(hrrr["temp"], dtype=np.float32)
+    t2m = np.asarray(hrrr["t2m"], dtype=np.float32)
+    qv = np.asarray(hrrr["qv"], dtype=np.float32)
+    u = np.asarray(hrrr["u"], dtype=np.float32)
+    v = np.asarray(hrrr["v"], dtype=np.float32)
+    omega = np.asarray(hrrr["omega"], dtype=np.float32)
+    z_mid = np.asarray(hrrr["z_mid"], dtype=np.float32)
+    ps = np.asarray(hrrr["ps"], dtype=np.float32)
+    hgt_sfc = np.asarray(hrrr["hgt_sfc"], dtype=np.float32)
+    landfrac = np.asarray(hrrr["landfrac"], dtype=np.float32)
+
+    for name, arr in (
+        ("temp", temp),
+        ("t2m", t2m),
+        ("qv", qv),
+        ("u", u),
+        ("v", v),
+        ("omega", omega),
+        ("z_mid", z_mid),
+        ("ps", ps),
+        ("hgt_sfc", hgt_sfc),
+        ("landfrac", landfrac),
+    ):
+        _require_finite(name, arr)
+
+    if float(ps.min()) < 5.0e4 or float(ps.max()) > 1.2e5:
+        raise ValueError(
+            "surface pressure appears out-of-range for Pa units: "
+            f"min={float(ps.min()):.3g}, max={float(ps.max()):.3g}"
+        )
+    if float(temp.min()) < 150.0 or float(temp.max()) > 400.0:
+        raise ValueError(
+            "pressure-level TMP appears out-of-range for Kelvin units: "
+            f"min={float(temp.min()):.3g}, max={float(temp.max()):.3g}"
+        )
+    if float(t2m.min()) < 150.0 or float(t2m.max()) > 400.0:
+        raise ValueError(
+            "2m TMP appears out-of-range for Kelvin units: "
+            f"min={float(t2m.min()):.3g}, max={float(t2m.max()):.3g}"
+        )
+    if float(qv.min()) < -1.0e-7 or float(qv.max()) > 0.1:
+        raise ValueError(
+            "SPFH appears out-of-range for kg/kg units: "
+            f"min={float(qv.min()):.3g}, max={float(qv.max()):.3g}"
+        )
+    if float(landfrac.min()) < -0.05 or float(landfrac.max()) > 1.05:
+        raise ValueError(
+            "LAND appears out-of-range for [0,1] fraction units: "
+            f"min={float(landfrac.min()):.3g}, max={float(landfrac.max()):.3g}. "
+            "If your source is percent, convert to fraction before use."
+        )
+    if float(np.abs(omega).max()) > 100.0:
+        raise ValueError(
+            "VVEL magnitude appears out-of-range for Pa/s units: "
+            f"absmax={float(np.abs(omega).max()):.3g}"
+        )
+    if float(np.abs(u).max()) > 250.0 or float(np.abs(v).max()) > 250.0:
+        raise ValueError(
+            "wind speed appears out-of-range for m/s units: "
+            f"u_absmax={float(np.abs(u).max()):.3g}, v_absmax={float(np.abs(v).max()):.3g}"
+        )
+    if float(z_mid.min()) < -1000.0 or float(z_mid.max()) > 100000.0:
+        raise ValueError(
+            "HGT appears out-of-range for meters units: "
+            f"min={float(z_mid.min()):.3g}, max={float(z_mid.max()):.3g}"
+        )
+    if float(hgt_sfc.min()) < -1000.0 or float(hgt_sfc.max()) > 10000.0:
+        raise ValueError(
+            "surface HGT appears out-of-range for meters units: "
+            f"min={float(hgt_sfc.min()):.3g}, max={float(hgt_sfc.max()):.3g}"
+        )
+
+    # Helpful diagnostic even when all checks pass.
+    print(
+        "unit checks passed: "
+        f"ps=[{float(ps.min()):.3g},{float(ps.max()):.3g}] Pa, "
+        f"T=[{float(temp.min()):.3g},{float(temp.max()):.3g}] K, "
+        f"T2m=[{float(t2m.min()):.3g},{float(t2m.max()):.3g}] K, "
+        f"qv=[{float(qv.min()):.3g},{float(qv.max()):.3g}] kg/kg, "
+        f"omega_absmax={float(np.abs(omega).max()):.3g} Pa/s, "
+        f"landfrac=[{float(landfrac.min()):.3g},{float(landfrac.max()):.3g}]"
+    )
+
+
 def _target_pressures_from_aux(
     vertical_coordinate_path: str,
     surface_pressure_pa: np.ndarray,
@@ -515,6 +607,7 @@ def main() -> None:
         f"tile lat range=({float(np.min(hrrr['lat_tile'])):.2f}, {float(np.max(hrrr['lat_tile'])):.2f}) "
         f"lon range=({float(np.min(hrrr['lon_tile'])):.2f}, {float(np.max(hrrr['lon_tile'])):.2f})"
     )
+    validate_hrrr_input_units(hrrr)
 
     model = load_model_without_scream_zarr(
         checkpoint_path=str(checkpoint_path),
