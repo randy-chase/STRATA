@@ -31,6 +31,7 @@ import s3fs
 import torch
 import xarray as xr
 import zarr
+from earth2grid import KNNS2Interpolator
 from pyproj import CRS, Transformer
 
 # Ensure repo-local imports resolve even when launched outside repo root.
@@ -363,18 +364,70 @@ def build_scream_inputs(
         np.float32
     )[None, :, None]
 
-    phis = np.asarray(hrrr["hgt_sfc"], dtype=np.float32) * GRAVITY
-    sgh30 = np.zeros_like(phis, dtype=np.float32)
-    landfrac = np.asarray(hrrr["landfrac"], dtype=np.float32)
-    static_tile = np.stack([phis, sgh30, landfrac], axis=0).astype(np.float32)[:, None]
-
     stats = {
         "theta": (float(theta_on_scream.min()), float(theta_on_scream.max())),
         "qv": (float(qv_on_scream.min()), float(qv_on_scream.max())),
         "u": (float(u_on_scream.min()), float(u_on_scream.max())),
         "v": (float(v_on_scream.min()), float(v_on_scream.max())),
     }
-    return x_np, static_tile, stats
+    return x_np, stats
+
+
+def _resolve_sgh30_path(aux_root: Path, checkpoint_path: Path) -> Path:
+    candidates = [
+        aux_root / "sgh30.npy",
+        checkpoint_path.parent.parent / "sgh30.npy",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        "Could not find sgh30.npy. Expected one of:\n"
+        f"  {candidates[0]}\n"
+        f"  {candidates[1]}"
+    )
+
+
+def build_static_forcing_tile(
+    hrrr: dict[str, np.ndarray | np.datetime64 | str | tuple[int, int]],
+    *,
+    aux_root: Path,
+    checkpoint_path: Path,
+) -> np.ndarray:
+    lat_tile = np.asarray(hrrr["lat_tile"], dtype=np.float32)
+    lon_tile = np.asarray(hrrr["lon_tile"], dtype=np.float32)
+    phis = np.asarray(hrrr["hgt_sfc"], dtype=np.float32) * GRAVITY
+    landfrac = np.asarray(hrrr["landfrac"], dtype=np.float32)
+
+    latlon_path = aux_root / "latlon_ne1024pg2.nc"
+    if not latlon_path.exists():
+        raise FileNotFoundError(f"missing required file: {latlon_path}")
+    sgh30_path = _resolve_sgh30_path(aux_root=aux_root, checkpoint_path=checkpoint_path)
+
+    with xr.open_dataset(latlon_path) as ds_ll:
+        src_lat = np.asarray(ds_ll["lat"].values, dtype=np.float32).reshape(-1)
+        src_lon = np.asarray(ds_ll["lon"].values, dtype=np.float32).reshape(-1)
+    src_sgh30 = np.asarray(np.load(sgh30_path), dtype=np.float32).reshape(-1)
+    if src_sgh30.shape[0] != src_lat.shape[0]:
+        raise ValueError(
+            f"sgh30 size mismatch: {sgh30_path} has {src_sgh30.shape[0]} values, "
+            f"but {latlon_path} has {src_lat.shape[0]} columns."
+        )
+
+    tgt_lat = lat_tile.reshape(-1)
+    tgt_lon = lon_tile.reshape(-1)
+    interp = KNNS2Interpolator(src_lon, src_lat, tgt_lon, tgt_lat, k=1).float()
+    src_sgh30_t = torch.from_numpy(src_sgh30.astype(np.float32))
+    sgh30 = interp(src_sgh30_t).detach().cpu().numpy().reshape(lat_tile.shape)
+
+    static_tile = np.stack([phis, sgh30, landfrac], axis=0).astype(np.float32)[:, None]
+    print(
+        "static forcing ranges: "
+        f"phis=[{float(phis.min()):.5g},{float(phis.max()):.5g}] "
+        f"sgh30=[{float(sgh30.min()):.5g},{float(sgh30.max()):.5g}] "
+        f"landfrac=[{float(landfrac.min()):.5g},{float(landfrac.max()):.5g}]"
+    )
+    return static_tile
 
 
 def load_model_without_scream_zarr(
@@ -620,10 +673,15 @@ def main() -> None:
     model.eval()
 
     input_vars = list(model.input_coords()["variable"])
-    x_np, static_tile, stats = build_scream_inputs(
+    x_np, stats = build_scream_inputs(
         hrrr=hrrr,
         in_variable_names=input_vars,
         vertical_coordinate_path=str(vertical_path),
+    )
+    static_tile = build_static_forcing_tile(
+        hrrr=hrrr,
+        aux_root=aux_root,
+        checkpoint_path=checkpoint_path,
     )
     print(f"input tensor shape={tuple(x_np.shape)}")
     for key, (vmin, vmax) in stats.items():
